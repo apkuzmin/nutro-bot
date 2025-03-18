@@ -249,7 +249,7 @@ async def process_day_end_time(update: Update, context: ContextTypes.DEFAULT_TYP
         # Создаем клавиатуру для настроек
         keyboard = [
             [InlineKeyboardButton("📝 Обновить анкету", callback_data="update_profile"), 
-             InlineKeyboardButton("🎯 Установить свою норму", callback_data="set_custom_macros")],
+             InlineKeyboardButton("🎯 Установить норму", callback_data="set_custom_macros")],
             [InlineKeyboardButton(f"⏰ Завершения дня: {formatted_time}", callback_data="set_day_end_time"),
              InlineKeyboardButton(f"🌐 Часовой пояс: UTC{'+' if timezone >= 0 else ''}{timezone}", callback_data="change_timezone")],
             [InlineKeyboardButton("Сменить язык", callback_data="change_language")],
@@ -294,45 +294,49 @@ async def change_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = query.from_user.id
     current_timezone = get_user_timezone(user_id)
     
-    # Создаем кнопки для выбора часового пояса
-    # Текущий час для каждого часового пояса
-    current_hour = datetime.utcnow().hour
-    current_minute = datetime.utcnow().minute
+    # Текущее время по UTC
+    now_utc = datetime.utcnow()
+    current_hour_utc = now_utc.hour
+    current_minute = now_utc.minute
     
-    # Создаем словарь для группировки часовых поясов по отображаемому времени
+    # Словарь для группировки часовых поясов по времени
     time_to_tz = {}
     
-    # Сначала группируем часовые пояса по отображаемому времени
-    for tz in range(-12, 15):
-        tz_hour = (current_hour + tz) % 24
-        tz_minute = current_minute
-        tz_label = f"{tz_hour:02d}:{tz_minute:02d}"
+    # Группируем часовые пояса по времени
+    for tz_offset in range(-12, 15):
+        # Вычисляем время в этом часовом поясе
+        tz_hour = (current_hour_utc + tz_offset) % 24
+        time_str = f"{tz_hour:02d}:{current_minute:02d}"
         
-        # Если такое время уже есть, добавляем часовой пояс к существующему
-        if tz_label in time_to_tz:
-            time_to_tz[tz_label].append(tz)
+        # Добавляем часовой пояс к соответствующему времени
+        if time_str in time_to_tz:
+            time_to_tz[time_str].append(tz_offset)
         else:
-            time_to_tz[tz_label] = [tz]
+            time_to_tz[time_str] = [tz_offset]
     
-    # Теперь создаем кнопки, группируя по 3 в строке
+    # Создаем клавиатуру
     keyboard = []
     row = []
     
-    # Сортируем времена по часам для логичного порядка
+    # Сортируем времена для логичного порядка
     sorted_times = sorted(time_to_tz.keys(), key=lambda x: int(x.split(':')[0]))
     
-    for tz_label in sorted_times:
-        tz_list = time_to_tz[tz_label]
+    # Добавляем кнопки для каждого уникального времени
+    for time_str in sorted_times:
         # Берем первый часовой пояс из списка для этого времени
-        tz = tz_list[0]
+        tz_offset = time_to_tz[time_str][0]
         
         # Добавляем кнопку в текущий ряд (только время без UTC)
-        row.append(InlineKeyboardButton(tz_label, callback_data=f"tz_{tz}"))
+        row.append(InlineKeyboardButton(time_str, callback_data=f"tz_{tz_offset}"))
         
-        # Если в ряду уже 3 кнопки или это последнее время, добавляем ряд в клавиатуру
-        if len(row) == 3 or tz_label == sorted_times[-1]:
+        # Если в ряду уже 3 кнопки, добавляем ряд в клавиатуру
+        if len(row) == 3:
             keyboard.append(row)
             row = []
+    
+    # Добавляем оставшиеся кнопки, если есть
+    if row:
+        keyboard.append(row)
     
     # Добавляем кнопку "Назад"
     keyboard.append([InlineKeyboardButton("⬅ Назад", callback_data="settings")])

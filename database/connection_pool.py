@@ -93,7 +93,13 @@ class DatabaseConnectionPool:
             sqlite3.Connection: Новое соединение с базой данных
         """
         try:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            # Для Windows используем более консервативные настройки
+            if os.name == 'nt':
+                conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+                conn.execute("PRAGMA busy_timeout = 30000")  # 30 секунд таймаут для занятых операций
+            else:
+                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            
             # Включаем поддержку внешних ключей
             conn.execute("PRAGMA foreign_keys = ON")
             
@@ -104,8 +110,11 @@ class DatabaseConnectionPool:
                 conn.execute("PRAGMA cache_size = 10000")
                 conn.execute("PRAGMA temp_store = MEMORY")
             return conn
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка SQLite при создании соединения с БД {self.db_path}: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Ошибка при создании соединения с БД {self.db_path}: {e}")
+            logger.error(f"Неожиданная ошибка при создании соединения с БД {self.db_path}: {e}")
             return None
     
     def get_connection(self):
@@ -117,8 +126,12 @@ class DatabaseConnectionPool:
         
         Raises:
             TimeoutError: Если не удалось получить соединение в течение таймаута
+            sqlite3.Error: Если не удалось создать новое соединение
         """
         start_time = time.time()
+        retry_count = 0
+        max_retries = 3
+        base_delay = 0.1
         
         while True:
             # Проверяем, не превышен ли таймаут
@@ -128,6 +141,8 @@ class DatabaseConnectionPool:
             try:
                 # Пытаемся получить соединение из пула
                 conn = self.pool.get(block=False)
+                # Проверяем, что соединение все еще работает
+                conn.execute("SELECT 1")
                 logger.debug(f"Получено соединение из пула для {self.db_path}")
                 return conn
             except queue.Empty:
@@ -141,9 +156,16 @@ class DatabaseConnectionPool:
                             return conn
                         else:
                             self.active_connections -= 1
+                            if retry_count < max_retries:
+                                retry_count += 1
+                                delay = base_delay * (2 ** (retry_count - 1))
+                                logger.warning(f"Не удалось создать соединение, попытка {retry_count}/{max_retries} через {delay:.1f}с")
+                                time.sleep(delay)
+                                continue
+                            raise sqlite3.Error(f"Не удалось создать соединение с БД {self.db_path} после {max_retries} попыток")
                 
                 # Если не удалось создать новое соединение, ждем немного и пробуем снова
-                time.sleep(0.1)
+                time.sleep(base_delay)
     
     def return_connection(self, conn):
         """
@@ -152,15 +174,37 @@ class DatabaseConnectionPool:
         Args:
             conn (sqlite3.Connection): Соединение для возврата в пул
         """
+        if conn is None:
+            logger.warning(f"Попытка вернуть None соединение в пул для {self.db_path}")
+            return
+            
         try:
             # Проверяем, что соединение все еще работает
             conn.execute("SELECT 1")
             # Возвращаем соединение в пул
             self.pool.put(conn, block=False)
             logger.debug(f"Соединение возвращено в пул для {self.db_path}")
-        except (sqlite3.Error, queue.Full) as e:
-            # Если соединение повреждено или пул полон, закрываем его
-            logger.warning(f"Не удалось вернуть соединение в пул для {self.db_path}: {e}")
+        except sqlite3.Error as e:
+            # Если соединение повреждено, закрываем его
+            logger.warning(f"Соединение повреждено для {self.db_path}: {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self.lock:
+                self.active_connections -= 1
+        except queue.Full:
+            # Если пул полон, закрываем соединение
+            logger.warning(f"Пул соединений полон для {self.db_path}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self.lock:
+                self.active_connections -= 1
+        except Exception as e:
+            # Обрабатываем любые другие неожиданные ошибки
+            logger.error(f"Неожиданная ошибка при возврате соединения в пул для {self.db_path}: {e}")
             try:
                 conn.close()
             except Exception:
@@ -177,8 +221,10 @@ class DatabaseConnectionPool:
                 try:
                     conn = self.pool.get(block=False)
                     conn.close()
+                except sqlite3.Error as e:
+                    logger.warning(f"Ошибка SQLite при закрытии соединения: {e}")
                 except Exception as e:
-                    logger.warning(f"Ошибка при закрытии соединения: {e}")
+                    logger.warning(f"Неожиданная ошибка при закрытии соединения: {e}")
             self.active_connections = 0
             logger.info(f"Все соединения закрыты для {self.db_path}")
 
@@ -199,6 +245,12 @@ def get_db_connection(db_name):
     try:
         conn = pool.get_connection()
         yield conn
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка SQLite при работе с БД {db_name}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при работе с БД {db_name}: {e}")
+        raise
     finally:
         if conn:
             pool.return_connection(conn)
@@ -215,14 +267,39 @@ def transaction(conn):
     Yields:
         sqlite3.Connection: То же соединение с базой данных
     """
-    try:
-        conn.execute("BEGIN TRANSACTION")
-        yield conn
-        conn.execute("COMMIT")
-    except Exception as e:
-        logger.error(f"Ошибка в транзакции: {e}")
-        conn.execute("ROLLBACK")
-        raise
+    retry_count = 0
+    max_retries = 3
+    base_delay = 0.5  # Начальная задержка в секундах
+    
+    while True:
+        try:
+            # Устанавливаем таймаут для занятых операций
+            conn.execute("PRAGMA busy_timeout = 30000")  # 30 секунд
+            
+            # Начинаем транзакцию
+            conn.execute("BEGIN TRANSACTION")
+            
+            try:
+                yield conn
+                conn.execute("COMMIT")
+                return
+            except Exception as e:
+                conn.execute("ROLLBACK")
+                raise
+                
+        except sqlite3.Error as e:
+            error_msg = str(e).lower()
+            if retry_count < max_retries and ("database is locked" in error_msg or "busy" in error_msg):
+                retry_count += 1
+                delay = base_delay * (2 ** (retry_count - 1))  # Экспоненциальная задержка
+                logger.warning(f"База данных заблокирована, попытка {retry_count}/{max_retries} через {delay:.1f}с")
+                time.sleep(delay)
+                continue
+            logger.error(f"Ошибка SQLite в транзакции: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка в транзакции: {e}")
+            raise
 
 # Функции-хелперы для получения соединений с конкретными базами данных
 @contextmanager

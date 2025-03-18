@@ -115,48 +115,49 @@ async def goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data["goal"] = query.data
         logger.debug(f"Цель сохранена в context.user_data: {context.user_data['goal']}")
         
-        # Текущее время
-        current_hour = datetime.utcnow().hour
-        current_minute = datetime.utcnow().minute
+        # Текущее время по UTC
+        now_utc = datetime.utcnow()
+        current_hour_utc = now_utc.hour
+        current_minute = now_utc.minute
         
-        # Создаем словарь для группировки часовых поясов по отображаемому времени
-        time_groups = {}
+        # Словарь для группировки часовых поясов по времени
+        time_to_tz = {}
         
-        # Заполняем словарь
+        # Группируем часовые пояса по времени
         for tz_offset in range(-12, 15):
-            current_hour = (current_hour + tz_offset) % 24
-            current_time = f"{current_hour:02d}:{current_minute:02d}"
+            # Вычисляем время в этом часовом поясе
+            tz_hour = (current_hour_utc + tz_offset) % 24
+            time_str = f"{tz_hour:02d}:{current_minute:02d}"
             
-            if current_time in time_groups:
-                time_groups[current_time].append(tz_offset)
+            # Добавляем часовой пояс к соответствующему времени
+            if time_str in time_to_tz:
+                time_to_tz[time_str].append(tz_offset)
             else:
-                time_groups[current_time] = [tz_offset]
-        
-        # Сортируем времена для отображения в порядке возрастания
-        sorted_times = sorted(time_groups.keys())
+                time_to_tz[time_str] = [tz_offset]
         
         # Создаем клавиатуру
         keyboard = []
         row = []
         
+        # Сортируем времена для логичного порядка
+        sorted_times = sorted(time_to_tz.keys(), key=lambda x: int(x.split(':')[0]))
+        
         # Добавляем кнопки для каждого уникального времени
         for time_str in sorted_times:
-            tz_offsets = time_groups[time_str]
-            main_tz = tz_offsets[0]  # Берем первый часовой пояс из группы
+            # Берем первый часовой пояс из списка для этого времени
+            tz_offset = time_to_tz[time_str][0]
             
-            # Формируем текст кнопки
-            if len(tz_offsets) > 1:
-                button_text = f"{time_str} (UTC{'+' if main_tz >= 0 else ''}{main_tz} и др.)"
-            else:
-                button_text = f"{time_str} (UTC{'+' if main_tz >= 0 else ''}{main_tz})"
+            # Добавляем кнопку в текущий ряд (только время без UTC)
+            row.append(InlineKeyboardButton(time_str, callback_data=str(tz_offset)))
             
-            # Добавляем кнопку в текущий ряд
-            row.append(InlineKeyboardButton(button_text, callback_data=str(main_tz)))
-            
-            # Если в ряду уже 3 кнопки или это последнее время, добавляем ряд в клавиатуру
-            if len(row) == 3 or time_str == sorted_times[-1]:
+            # Если в ряду уже 3 кнопки, добавляем ряд в клавиатуру
+            if len(row) == 3:
                 keyboard.append(row)
                 row = []
+        
+        # Добавляем оставшиеся кнопки, если есть
+        if row:
+            keyboard.append(row)
         
         try:
             reply_markup = InlineKeyboardMarkup(keyboard)

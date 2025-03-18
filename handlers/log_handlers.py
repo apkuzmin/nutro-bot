@@ -1,13 +1,14 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 from database import get_food_log, update_food_log, delete_food_log, get_product_data, get_daily_intake, get_current_day
+from database.food_log_db import update_daily_intake_for_user
 from config import EDIT_FOOD_WEIGHT
 import logging
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-async def show_food_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_food_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         if update.callback_query:
             query = update.callback_query
@@ -31,7 +32,7 @@ async def show_food_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             reply_func = update.message.reply_text
             log_date = None
         else:
-            return
+            return ConversationHandler.END
 
         # Если дата не указана, используем текущий день
         if log_date is None:
@@ -71,13 +72,8 @@ async def show_food_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 protein = log["protein"]
                 fat = log["fat"]
                 carbs = log["carbs"]
-                timestamp = log["timestamp"]
+                time_str = log["time"][:5]  # Берем только часы и минуты
                 edit_code = log["edit_code"]
-                
-                if "T" in timestamp:
-                    time_str = timestamp.split('T')[1][:5]
-                else:
-                    time_str = "00:00"
                 
                 if edited_log_id == log_id and old_weight is not None and "just_edited" in context.user_data:
                     html_message += (
@@ -128,6 +124,9 @@ async def show_food_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     )
                 except Exception as e2:
                     logger.error(f"Ошибка при отправке нового сообщения: {e2}")
+        
+        return ConversationHandler.END
+        
     except Exception as e:
         logger.error(f"Необработанная ошибка в show_food_log: {e}")
         if update.callback_query:
@@ -135,6 +134,7 @@ async def show_food_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await update.callback_query.answer("Произошла ошибка. Пожалуйста, попробуйте еще раз.")
             except:
                 pass
+        return ConversationHandler.END
 
 async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
@@ -164,19 +164,12 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     protein = log_entry["protein"]
     fat = log_entry["fat"]
     carbs = log_entry["carbs"]
-    timestamp = log_entry["timestamp"]
+    time_str = log_entry["time"][:5]  # Берем только часы и минуты
     
     logger.debug(f"Found log entry: {food_name}, log_id: {log_id}")
     context.user_data["edit_log_id"] = log_id
     context.user_data["old_weight"] = weight
     
-    # Извлекаем время из timestamp
-    if "T" in timestamp:
-        time_str = timestamp.split('T')[1][:5]
-    else:
-        # Если формат timestamp изменился, используем значение по умолчанию
-        time_str = "00:00"
-        
     html_message = (
         f"<b>Редактирование:</b>\n"
         f"{food_name} {weight:.0f}г — {kcal:.0f} ккал ({protein:.1f}Б / {fat:.1f}Ж / {carbs:.1f}У)\n"
@@ -208,19 +201,49 @@ async def edit_food_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return ConversationHandler.END
 
         old_weight = log_entry["weight"]
-        update_food_log(log_id, new_weight)
+        success, updated_user_id, log_date = update_food_log(log_id, new_weight)
+        
+        if not success:
+            from handlers.utils import get_main_menu
+            await update.message.reply_text("Не удалось обновить запись. Пожалуйста, попробуйте ещё раз.", reply_markup=get_main_menu())
+            return ConversationHandler.END
+        
+        # Обновляем дневное потребление вручную
+        update_daily_intake_for_user(updated_user_id, log_date)
 
         context.user_data["old_weight"] = old_weight
         context.user_data["just_edited"] = True
-
-        await show_food_log(update, context)
-
-        if "old_weight" in context.user_data:
-            del context.user_data["old_weight"]
-        if "edit_log_id" in context.user_data:
-            del context.user_data["edit_log_id"]
-
-        return ConversationHandler.END
+        
+        try:
+            # Отправляем сообщение об успешном обновлении
+            await update.message.reply_text(f"✅ Вес продукта обновлен с {old_weight:.0f}г на {new_weight:.0f}г")
+            
+            # Обновляем отображение истории питания
+            from handlers.utils import get_main_menu
+            await show_food_log(update, context)
+            
+            # Очищаем данные
+            if "old_weight" in context.user_data:
+                del context.user_data["old_weight"]
+            if "edit_log_id" in context.user_data:
+                del context.user_data["edit_log_id"]
+            
+            return ConversationHandler.END
+            
+        except Exception as e:
+            logger.error(f"Ошибка при отображении обновленной истории: {e}")
+            from handlers.utils import get_main_menu
+            await update.message.reply_text(
+                "Вес продукта обновлен, но произошла ошибка при обновлении истории. Используйте команду /start, чтобы вернуться в главное меню.",
+                reply_markup=get_main_menu()
+            )
+            return ConversationHandler.END
+            
     except ValueError:
         await update.message.reply_text("Введи число. Сколько г?")
         return EDIT_FOOD_WEIGHT
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании веса: {e}")
+        from handlers.utils import get_main_menu
+        await update.message.reply_text("Произошла ошибка. Пожалуйста, попробуйте еще раз.", reply_markup=get_main_menu())
+        return ConversationHandler.END
