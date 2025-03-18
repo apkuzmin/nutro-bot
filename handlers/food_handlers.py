@@ -1,20 +1,27 @@
-import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes, ConversationHandler
-from config import FOOD_NAME, FOOD_WEIGHT, ADMIN_ADD, ADMIN_KCAL, ADMIN_PROTEIN, ADMIN_FAT, ADMIN_CARBS, ADMIN_ID, EDIT_FOOD_WEIGHT, DEEPSEEK_API_KEY, DEEPSEEK_API_URL
-from database import get_product_data, save_product_data, search_products, delete_food_log, log_food, get_user_data, get_daily_intake, get_product_by_barcode, save_barcode_product
-from openai import OpenAI
+"""
+Обработчики команд, связанных с едой и поиском продуктов.
+"""
+
 import re
-import json
 import logging
+import random
+import asyncio
+import os
+import json
 import time
 from functools import lru_cache
-import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram.ext import ContextTypes, ConversationHandler
+from config import TOKEN, DEEPSEEK_API_KEY, DEEPSEEK_API_URL, FOOD_NAME, FOOD_WEIGHT, ADMIN_ADD, ADMIN_KCAL, ADMIN_PROTEIN, ADMIN_FAT, ADMIN_CARBS, ADMIN_ID, EDIT_FOOD_WEIGHT
+from database.products_db import get_product_data, save_product_data, search_products, add_product_alias, get_product_by_barcode, save_barcode_product
+from database.food_log_db import log_food, delete_food_log, update_daily_intake_for_user
+from database.users_db import get_user_data, get_daily_intake
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-# Отключаем логирование SSL ключей, чтобы избежать ошибки доступа
-os.environ["SSLKEYLOGFILE"] = ""
+# Отключаем логирование SSL-ключей, чтобы избежать ошибки Permission denied на C:\ssl-keys.log
+os.environ['SSLKEYLOGFILE'] = ''
 
 # Создаем функцию для получения клиента OpenAI с повторными попытками
 @lru_cache(maxsize=1)
@@ -39,8 +46,8 @@ async def call_ai_api(food_name, max_retries=3, retry_delay=2):
             response = client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[
-                    {"role": "system", "content": "Ты — эксперт по питанию. Предоставь точные данные о пищевой ценности продукта на 100 г СТРОГО в формате: [калории] [белки] [жиры] [углеводы]. Например: 165 31 3.6 0. НЕ ИСПОЛЬЗУЙ единицы измерения, НЕ ИСПОЛЬЗУЙ форматирование текста, НЕ ДОБАВЛЯЙ дополнительную информацию. ТОЛЬКО четыре числа через пробел."},
-                    {"role": "user", "content": f"Какая пищевая ценность у '{food_name}' на 100 г? Ответь ТОЛЬКО четырьмя числами через пробел: калории, белки, жиры, углеводы."}
+                    {"role": "system", "content": "Nutrition expert. Format: [corrected_name] | [calories] [proteins] [fats] [carbs]. No units. Fix typos."},
+                    {"role": "user", "content": f"Nutrition per 100g of '{food_name}'? Format: name | calories proteins fats carbs. Only numbers, no g/kcal units."}
                 ],
                 stream=False
             )
@@ -76,6 +83,8 @@ async def add_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def food_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     food = update.message.text.lower()
+    original_food = food  # Сохраняем оригинальный запрос пользователя
+    context.user_data["original_food"] = original_food  # Сохраняем для возможного использования
     context.user_data["food"] = food
     logger.debug(f"Food name entered: {food}")
 
@@ -109,54 +118,71 @@ async def food_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 response = await call_ai_api(food)
                 logger.debug(f"DeepSeek response: {response}")
 
-                # Попробуем извлечь данные в числовом формате: "158 5.5 1.1 30.1"
-                numeric_pattern = r"(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)"
-                numeric_match = re.search(numeric_pattern, response)
-
-                if numeric_match:
-                    kcal = float(numeric_match.group(1))
-                    protein = float(numeric_match.group(2))
-                    fat = float(numeric_match.group(3))
-                    carbs = float(numeric_match.group(4))
-                else:
-                    # Удаляем markdown-форматирование (** для жирного текста)
-                    clean_text = re.sub(r'\*\*([^*]+)\*\*', r'\1', response)
+                # Ищем формат с возможными единицами измерения (kcal, g) в ответе
+                pattern = r"(.+?)\s*\|\s*(\d+\.?\d*)(?:\s*kcal)?\s+(\d+\.?\d*)(?:\s*g)?\s+(\d+\.?\d*)(?:\s*g)?\s+(\d+\.?\d*)(?:\s*g)?"
+                match = re.search(pattern, response)
+                
+                if match:
+                    std_name = match.group(1).strip()
+                    kcal = float(match.group(2))
+                    protein = float(match.group(3))
+                    fat = float(match.group(4))
+                    carbs = float(match.group(5))
+                    logger.info(f"Извлечены значения: название='{std_name}', ккал={kcal}, белки={protein}, жиры={fat}, углеводы={carbs}")
                     
-                    # Альтернативный формат с единицами измерения - улучшенный паттерн
-                    text_pattern = r"(\d+[.,]?\d*)\s*(?:кк?ал|ккалорий|калорий)[.,]?.*?(\d+[.,]?\d*)\s*(?:г|гр)?\s*(?:белк[ао]|протеин)[ао]?[в]?.*?(\d+[.,]?\d*)\s*(?:г|гр)?\s*жир[ао]?[в]?.*?(\d+[.,]?\d*)\s*(?:г|гр)?\s*(?:углевод|угле)[ао]?[в]?"
-                    text_match = re.search(text_pattern, clean_text, re.IGNORECASE | re.DOTALL)
+                    # Проверяем, было ли исправлено название
+                    was_corrected = std_name.lower() != food.lower()
                     
-                    if text_match:
-                        # Заменяем запятые на точки для корректного преобразования в float
-                        kcal = float(text_match.group(1).replace(',', '.'))
-                        protein = float(text_match.group(2).replace(',', '.'))
-                        fat = float(text_match.group(3).replace(',', '.'))
-                        carbs = float(text_match.group(4).replace(',', '.'))
-                    else:
-                        # Еще более общий паттерн для поиска чисел рядом с ключевыми словами
-                        kcal_pattern = r"(\d+[.,]?\d*)\s*(?:кк?ал|ккалорий|калорий)"
-                        protein_pattern = r"(\d+[.,]?\d*)\s*(?:г|гр)?\s*(?:белк[ао]|протеин)"
-                        fat_pattern = r"(\d+[.,]?\d*)\s*(?:г|гр)?\s*жир"
-                        carbs_pattern = r"(\d+[.,]?\d*)\s*(?:г|гр)?\s*(?:углевод|угле)"
-                        
-                        kcal_match = re.search(kcal_pattern, clean_text, re.IGNORECASE)
-                        protein_match = re.search(protein_pattern, clean_text, re.IGNORECASE)
-                        fat_match = re.search(fat_pattern, clean_text, re.IGNORECASE)
-                        carbs_match = re.search(carbs_pattern, clean_text, re.IGNORECASE)
-                        
-                        if kcal_match and protein_match and fat_match and carbs_match:
-                            kcal = float(kcal_match.group(1).replace(',', '.'))
-                            protein = float(protein_match.group(1).replace(',', '.'))
-                            fat = float(fat_match.group(1).replace(',', '.'))
-                            carbs = float(carbs_match.group(1).replace(',', '.'))
+                    # Если DeepSeek вернул стандартизированное название, используем его
+                    if std_name and len(std_name) > 0:
+                        # Запоминаем оригинальный запрос и исправленный вариант
+                        if was_corrected:
+                            # Добавляем оригинальный запрос как альтернативное название
+                            logger.info(f"Добавляем альтернативное название (food_name): '{food}' -> '{std_name}'")
+                            save_product_data(std_name, kcal, protein, fat, carbs)
+                            add_product_alias(std_name, food)
+                            food = std_name
                         else:
-                            raise ValueError("Не удалось распознать данные от DeepSeek")
+                            save_product_data(food, kcal, protein, fat, carbs)
+                else:
+                    # Резервный вариант: попытка найти числа где угодно в ответе
+                    # Удаляем все нечисловые символы кроме точек и пробелов
+                    clean_text = re.sub(r'[^\d\.\s]', ' ', response)
+                    # Заменяем множественные пробелы на одиночные
+                    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                    
+                    # Разбиваем на числа
+                    numbers = [float(n) for n in clean_text.split() if re.match(r'\d+\.?\d*', n)]
+                    
+                    # Если нашли ровно 4 числа, используем их
+                    if len(numbers) >= 4:
+                        kcal, protein, fat, carbs = numbers[:4]
+                    else:
+                        # Если не удалось извлечь данные, выбрасываем исключение
+                        logger.error(f"Не удалось распознать данные от DeepSeek: '{response}'")
+                        raise ValueError("Не удалось распознать данные от DeepSeek")
 
+                # Сохраняем в базу исправленное название
                 save_product_data(food, kcal, protein, fat, carbs)
+                context.user_data["food"] = food  # Обновляем название в контексте
                 context.user_data["food_data"] = (kcal, protein, fat, carbs)
+                
+                # Если название было исправлено, добавляем оригинальное название как альтернативное
+                if was_corrected and original_food != food:
+                    logger.info(f"Добавляем альтернативное название: '{original_food}' -> '{food}'")
+                    add_product_alias(food, original_food)
+                
                 from handlers.utils import get_main_menu
                 keyboard = [[InlineKeyboardButton("🏠 Главное меню", callback_data="home")]]
-                message = f"✅ {food.capitalize()} — {kcal:.0f} ккал ({protein:.1f}Б / {fat:.1f}Ж / {carbs:.1f}У) на 100г\nУкажи вес в граммах:"
+                
+                # Формируем сообщение с указанием корректировки, если название было исправлено
+                if was_corrected:
+                    # Используем кириллическую версию названия для отображения
+                    display_name = food if is_cyrillic(food) else original_food.capitalize()
+                    message = f"✅ {display_name} — {kcal:.0f} ккал ({protein:.1f}Б / {fat:.1f}Ж / {carbs:.1f}У) на 100г\nУкажи вес в граммах:"
+                else:
+                    message = f"✅ {food.capitalize()} — {kcal:.0f} ккал ({protein:.1f}Б / {fat:.1f}Ж / {carbs:.1f}У) на 100г\nУкажи вес в граммах:"
+                
                 await update.message.reply_text(
                     message,
                     reply_markup=InlineKeyboardMarkup(keyboard)
@@ -174,6 +200,10 @@ async def food_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
                 return FOOD_NAME
+
+def is_cyrillic(text):
+    """Проверяет, содержит ли текст кириллические символы."""
+    return bool(re.search('[а-яА-Я]', text))
 
 async def food_name_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -215,6 +245,7 @@ async def food_name_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ADMIN_KCAL
     elif query.data == "calculate_custom":
         food = context.user_data.get("food", "неизвестный продукт")
+        original_food = food  # Сохраняем оригинальный запрос
         logger.debug(f"Calculating custom product with neural network: {food}")
         await query.edit_message_text(f"✅ Рассчитываю данные для '{food}'. Секунду...")
         
@@ -223,54 +254,58 @@ async def food_name_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             response = await call_ai_api(food)
             logger.debug(f"DeepSeek response: {response}")
 
-            # Попробуем извлечь данные в числовом формате: "158 5.5 1.1 30.1"
-            numeric_pattern = r"(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)"
-            numeric_match = re.search(numeric_pattern, response)
-
-            if numeric_match:
-                kcal = float(numeric_match.group(1))
-                protein = float(numeric_match.group(2))
-                fat = float(numeric_match.group(3))
-                carbs = float(numeric_match.group(4))
-            else:
-                # Удаляем markdown-форматирование (** для жирного текста)
-                clean_text = re.sub(r'\*\*([^*]+)\*\*', r'\1', response)
+            # Ищем формат с возможными единицами измерения (kcal, g) в ответе
+            pattern = r"(.+?)\s*\|\s*(\d+\.?\d*)(?:\s*kcal)?\s+(\d+\.?\d*)(?:\s*g)?\s+(\d+\.?\d*)(?:\s*g)?\s+(\d+\.?\d*)(?:\s*g)?"
+            match = re.search(pattern, response)
+            
+            if match:
+                std_name = match.group(1).strip()
+                kcal = float(match.group(2))
+                protein = float(match.group(3))
+                fat = float(match.group(4))
+                carbs = float(match.group(5))
                 
-                # Альтернативный формат с единицами измерения - улучшенный паттерн
-                text_pattern = r"(\d+[.,]?\d*)\s*(?:кк?ал|ккалорий|калорий)[.,]?.*?(\d+[.,]?\d*)\s*(?:г|гр)?\s*(?:белк[ао]|протеин)[ао]?[в]?.*?(\d+[.,]?\d*)\s*(?:г|гр)?\s*жир[ао]?[в]?.*?(\d+[.,]?\d*)\s*(?:г|гр)?\s*(?:углевод|угле)[ао]?[в]?"
-                text_match = re.search(text_pattern, clean_text, re.IGNORECASE | re.DOTALL)
+                # Проверяем, было ли исправлено название
+                was_corrected = std_name.lower() != food.lower()
                 
-                if text_match:
-                    # Заменяем запятые на точки для корректного преобразования в float
-                    kcal = float(text_match.group(1).replace(',', '.'))
-                    protein = float(text_match.group(2).replace(',', '.'))
-                    fat = float(text_match.group(3).replace(',', '.'))
-                    carbs = float(text_match.group(4).replace(',', '.'))
-                else:
-                    # Еще более общий паттерн для поиска чисел рядом с ключевыми словами
-                    kcal_pattern = r"(\d+[.,]?\d*)\s*(?:кк?ал|ккалорий|калорий)"
-                    protein_pattern = r"(\d+[.,]?\d*)\s*(?:г|гр)?\s*(?:белк[ао]|протеин)"
-                    fat_pattern = r"(\d+[.,]?\d*)\s*(?:г|гр)?\s*жир"
-                    carbs_pattern = r"(\d+[.,]?\d*)\s*(?:г|гр)?\s*(?:углевод|угле)"
-                    
-                    kcal_match = re.search(kcal_pattern, clean_text, re.IGNORECASE)
-                    protein_match = re.search(protein_pattern, clean_text, re.IGNORECASE)
-                    fat_match = re.search(fat_pattern, clean_text, re.IGNORECASE)
-                    carbs_match = re.search(carbs_pattern, clean_text, re.IGNORECASE)
-                    
-                    if kcal_match and protein_match and fat_match and carbs_match:
-                        kcal = float(kcal_match.group(1).replace(',', '.'))
-                        protein = float(protein_match.group(1).replace(',', '.'))
-                        fat = float(fat_match.group(1).replace(',', '.'))
-                        carbs = float(carbs_match.group(1).replace(',', '.'))
+                # Если DeepSeek вернул стандартизированное название, используем его
+                if std_name and len(std_name) > 0:
+                    # Запоминаем оригинальный запрос и исправленный вариант
+                    if was_corrected:
+                        # Добавляем оригинальный запрос как альтернативное название
+                        logger.info(f"Добавляем альтернативное название (calculate_custom): '{food}' -> '{std_name}'")
+                        save_product_data(std_name, kcal, protein, fat, carbs)
+                        add_product_alias(std_name, food)
+                        food = std_name
                     else:
-                        raise ValueError("Не удалось распознать данные от DeepSeek")
+                        save_product_data(food, kcal, protein, fat, carbs)
+                else:
+                    save_product_data(food, kcal, protein, fat, carbs)
 
+            # Ставим флаг, было ли исправлено название
+            was_corrected = original_food != food
+            
+            # Сохраняем в базу исправленное название
             save_product_data(food, kcal, protein, fat, carbs)
+            context.user_data["food"] = food  # Обновляем название в контексте
             context.user_data["food_data"] = (kcal, protein, fat, carbs)
+            
+            # Если название было исправлено, добавляем оригинальное название как альтернативное
+            if was_corrected and original_food != food:
+                logger.info(f"Добавляем альтернативное название: '{original_food}' -> '{food}'")
+                add_product_alias(food, original_food)
+            
             from handlers.utils import get_main_menu
             keyboard = [[InlineKeyboardButton("🏠 Главное меню", callback_data="home")]]
-            message = f"✅ {food.capitalize()} — {kcal:.0f} ккал ({protein:.1f}Б / {fat:.1f}Ж / {carbs:.1f}У) на 100г\nУкажи вес в граммах:"
+            
+            # Формируем сообщение с указанием корректировки, если название было исправлено
+            if was_corrected:
+                # Используем кириллическую версию названия для отображения
+                display_name = food if is_cyrillic(food) else original_food.capitalize()
+                message = f"✅ {display_name} — {kcal:.0f} ккал ({protein:.1f}Б / {fat:.1f}Ж / {carbs:.1f}У) на 100г\nУкажи вес в граммах:"
+            else:
+                message = f"✅ {food.capitalize()} — {kcal:.0f} ккал ({protein:.1f}Б / {fat:.1f}Ж / {carbs:.1f}У) на 100г\nУкажи вес в граммах:"
+            
             await query.edit_message_text(
                 message,
                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -308,13 +343,47 @@ async def food_name_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text("Укажи новый вес в граммах:")
         return EDIT_FOOD_WEIGHT
     elif query.data.startswith("delete_"):
-        log_id = int(query.data.replace("delete_", ""))
-        user_id = query.from_user.id
-        delete_food_log(log_id)
-        from handlers.log_handlers import show_food_log
-        await query.edit_message_text("Продукт удалён. Обновляю историю...")
-        await show_food_log(update, context)
-        return ConversationHandler.END
+        try:
+            log_id = int(query.data.replace("delete_", ""))
+            user_id = query.from_user.id
+            
+            # Удаляем запись и получаем данные для обновления дневного потребления
+            success, deleted_user_id, log_date = delete_food_log(log_id)
+            
+            if not success:
+                from handlers.utils import get_main_menu
+                await query.edit_message_text(
+                    "Не удалось удалить запись. Попробуйте еще раз.",
+                    reply_markup=get_main_menu()
+                )
+                return ConversationHandler.END
+            
+            # Обновляем дневное потребление вручную
+            update_daily_intake_for_user(deleted_user_id, log_date)
+            
+            await query.edit_message_text("Продукт удалён. Обновляю историю...")
+            
+            # Вызываем show_food_log, но обрабатываем возможные ошибки
+            try:
+                from handlers.log_handlers import show_food_log
+                await show_food_log(update, context)
+            except Exception as e:
+                logger.error(f"Ошибка при обновлении истории после удаления: {e}")
+                from handlers.utils import get_main_menu
+                await query.edit_message_text(
+                    "Продукт удалён. Но произошла ошибка при обновлении истории.",
+                    reply_markup=get_main_menu()
+                )
+            
+            return ConversationHandler.END
+        except Exception as e:
+            logger.error(f"Ошибка при удалении записи: {e}")
+            from handlers.utils import get_main_menu
+            await query.edit_message_text(
+                "Произошла ошибка при удалении записи. Пожалуйста, попробуйте ещё раз.",
+                reply_markup=get_main_menu()
+            )
+            return ConversationHandler.END
     elif query.data == "home":
         from handlers.menu_handlers import start
         return await start(update, context)

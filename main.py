@@ -9,10 +9,8 @@ from handlers.log_handlers import show_food_log, edit_menu, edit_food_weight
 from handlers.utils import cancel, get_main_menu, send_daily_summary, send_daily_summary_now, schedule_daily_summary_for_user
 from handlers.settings_handlers import set_custom_macros, process_calories, process_protein, process_fat, process_carbs, change_language, delete_data, confirm_delete, lang_ru, CALORIES, PROTEIN, FAT, CARBS, DELETE_CONFIRM, set_day_end_time_handler, process_day_end_time, DAY_END_TIME, change_timezone, process_timezone, TIMEZONE_SETTINGS
 from config import TOKEN, GENDER, AGE, WEIGHT, HEIGHT, ACTIVITY, GOAL, TIMEZONE, FOOD_NAME, FOOD_WEIGHT, ADMIN_ADD, ADMIN_KCAL, ADMIN_PROTEIN, ADMIN_FAT, ADMIN_CARBS, EDIT_FOOD_WEIGHT, CUSTOM_MACROS
-from database import init_all_db
-from datetime import time
+from database.connection_pool import get_users_connection
 import httpx
-from database.db_utils import get_users_db
 
 # Определяем уровень логирования на основе переменной окружения
 # В продакшн-среде установите NUTRO_ENV=production
@@ -44,18 +42,15 @@ async def set_bot_commands(app):
 async def schedule_all_daily_summaries(app):
     """Планирует отправку итогов дня для всех пользователей."""
     # Получаем соединение с базой данных пользователей
-    conn = get_users_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT user_id FROM users")
-    user_ids = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    with get_users_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT user_id FROM users")
+        user_ids = [row[0] for row in cursor.fetchall()]
     
     for user_id in user_ids:
         await schedule_daily_summary_for_user(user_id, app)
 
 def main():
-    init_all_db()
-    
     # Настройка HTTP-клиента с увеличенными таймаутами
     # В python-telegram-bot 20.x используется метод get_updates_http_version и get_updates_connection_pool_size
     # вместо request_kwargs

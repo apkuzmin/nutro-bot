@@ -93,7 +93,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # Создаем клавиатуру для настроек
     keyboard = [
         [InlineKeyboardButton("📝 Обновить анкету", callback_data="update_profile"), 
-         InlineKeyboardButton("🎯 Установить свою норму", callback_data="set_custom_macros")],
+         InlineKeyboardButton("🎯 Установить норму", callback_data="set_custom_macros")],
         [InlineKeyboardButton(f"⏰ Завершения дня: {day_end_time}", callback_data="set_day_end_time"),
          InlineKeyboardButton(f"🌐 Часовой пояс: UTC{'+' if timezone >= 0 else ''}{timezone}", callback_data="change_timezone")],
         [InlineKeyboardButton("Сменить язык", callback_data="change_language")],
@@ -124,6 +124,16 @@ async def subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ConversationHandler.END
 
 async def home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Обработчик для возврата в главное меню.
+    
+    Args:
+        update (Update): Объект обновления от Telegram
+        context (ContextTypes.DEFAULT_TYPE): Контекст обработчика
+        
+    Returns:
+        int: Следующее состояние диалога
+    """
     try:
         if update.callback_query:
             # Сразу отвечаем на callback-запрос, чтобы избежать залагивания кнопок
@@ -132,7 +142,21 @@ async def home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             except Exception as e:
                 logger.error(f"Ошибка при ответе на callback-запрос в home: {e}")
         
-        return await start(update, context)
+        # Получаем результат от start
+        try:
+            result = await start(update, context)
+            if result is None:
+                return ConversationHandler.END
+            return result
+        except Exception as e:
+            logger.error(f"Ошибка при вызове start в home: {e}")
+            if update.callback_query:
+                await update.callback_query.edit_message_text(
+                    "Произошла ошибка при возврате в главное меню. Пожалуйста, попробуйте еще раз.",
+                    reply_markup=get_main_menu()
+                )
+            return ConversationHandler.END
+        
     except Exception as e:
         logger.error(f"Необработанная ошибка в home: {e}")
         if update.callback_query:
@@ -142,6 +166,6 @@ async def home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     "Произошла ошибка при возврате в главное меню. Пожалуйста, попробуйте еще раз.",
                     reply_markup=get_main_menu()
                 )
-            except:
-                pass
+            except Exception as callback_error:
+                logger.error(f"Ошибка при обработке callback в home: {callback_error}")
         return ConversationHandler.END

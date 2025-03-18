@@ -16,6 +16,10 @@ from .products_db import (
 from .food_log_db import (
     log_food, get_food_log, update_food_log, delete_food_log
 )
+from .connection_pool import (
+    get_products_connection, get_users_connection, get_food_log_connection,
+    transaction, DatabaseConnectionPool
+)
 
 # Инициализация всех баз данных при импорте модуля
 init_all_db() 
