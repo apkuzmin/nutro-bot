@@ -6,7 +6,6 @@
 import time
 import logging
 from functools import lru_cache
-from .db_utils import get_products_db  # Оставляем для обратной совместимости
 from .connection_pool import get_products_connection, transaction
 
 logger = logging.getLogger(__name__)
@@ -17,14 +16,29 @@ def get_product_data(food_name):
     Получить данные о продукте по его названию.
     
     Args:
-        food_name (str): Название продукта
+        food_name (str): Название продукта или его альтернативное название
         
     Returns:
         tuple: (kcal, protein, fat, carbs) или None, если продукт не найден
     """
     with get_products_connection() as conn:
         cursor = conn.cursor()
+        
+        # Сначала ищем в основной таблице продуктов
         cursor.execute("SELECT kcal, protein, fat, carbs FROM products WHERE name = ?", (food_name,))
+        result = cursor.fetchone()
+        
+        if result:
+            return result
+        
+        # Если не нашли, ищем в альтернативных названиях
+        cursor.execute("""
+            SELECT p.kcal, p.protein, p.fat, p.carbs
+            FROM product_aliases a
+            JOIN products p ON a.product_id = p.id
+            WHERE a.alias_name = ?
+        """, (food_name,))
+        
         result = cursor.fetchone()
         return result
 
@@ -82,14 +96,41 @@ def search_products(query, limit=10):
     with get_products_connection() as conn:
         cursor = conn.cursor()
         
-        # Используем LIKE для поиска по части названия
+        # Используем LIKE для поиска по части названия в основной таблице продуктов
         cursor.execute(
-            "SELECT name FROM products WHERE name LIKE ? ORDER BY name LIMIT ?",
+            """
+            SELECT name FROM products 
+            WHERE name LIKE ? 
+            ORDER BY name 
+            LIMIT ?
+            """,
             (f"%{query}%", limit)
         )
         
         results = cursor.fetchall()
-        return [row[0] for row in results]
+        product_names = [row[0] for row in results]
+        
+        # Если количество результатов меньше лимита, поищем в альтернативных названиях
+        if len(product_names) < limit:
+            remaining_limit = limit - len(product_names)
+            
+            cursor.execute(
+                """
+                SELECT p.name 
+                FROM product_aliases a
+                JOIN products p ON a.product_id = p.id
+                WHERE a.alias_name LIKE ?
+                AND p.name NOT IN ({})
+                ORDER BY p.name
+                LIMIT ?
+                """.format(','.join(['?'] * len(product_names)) if product_names else 'SELECT NULL WHERE 0=1'),
+                [f"%{query}%"] + product_names + [remaining_limit]
+            )
+            
+            alias_results = cursor.fetchall()
+            product_names.extend([row[0] for row in alias_results])
+        
+        return product_names
 
 def get_product_by_barcode(barcode):
     """
@@ -170,4 +211,76 @@ def save_barcode_product(barcode, food_name):
                 )
                 logger.info(f"Добавлен новый штрихкод {barcode} для продукта {food_name}")
                 
+            return True
+
+def get_product_by_alias(alias_name):
+    """
+    Найти продукт по альтернативному названию.
+    
+    Args:
+        alias_name (str): Альтернативное название продукта
+        
+    Returns:
+        tuple: (product_id, name, kcal, protein, fat, carbs) или None, если продукт не найден
+    """
+    with get_products_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT p.id, p.name, p.kcal, p.protein, p.fat, p.carbs
+            FROM product_aliases a
+            JOIN products p ON a.product_id = p.id
+            WHERE a.alias_name = ?
+        """, (alias_name,))
+        result = cursor.fetchone()
+        
+        if result:
+            logger.info(f"Найден продукт по альтернативному названию '{alias_name}': {result[1]}")
+        else:
+            logger.info(f"Продукт по альтернативному названию '{alias_name}' не найден")
+            
+        return result
+
+def add_product_alias(product_name, alias_name):
+    """
+    Добавить альтернативное название продукта.
+    
+    Args:
+        product_name (str): Основное название продукта
+        alias_name (str): Альтернативное название продукта
+        
+    Returns:
+        bool: True если успешно добавлено, False в случае ошибки
+    """
+    with get_products_connection() as conn:
+        with transaction(conn) as tx:
+            cursor = tx.cursor()
+            
+            # Проверяем, существует ли продукт
+            cursor.execute("SELECT id FROM products WHERE name = ?", (product_name,))
+            product_result = cursor.fetchone()
+            
+            if not product_result:
+                logger.error(f"Не удалось добавить альтернативное название '{alias_name}' для продукта '{product_name}': продукт не найден")
+                return False
+                
+            product_id = product_result[0]
+            
+            # Проверяем, существует ли уже такое альтернативное название
+            cursor.execute("SELECT id FROM product_aliases WHERE alias_name = ?", (alias_name,))
+            alias_result = cursor.fetchone()
+            
+            if alias_result:
+                logger.warning(f"Альтернативное название '{alias_name}' уже существует в базе данных")
+                return False
+            
+            # Добавляем новое альтернативное название
+            cursor.execute(
+                "INSERT INTO product_aliases (product_id, alias_name, created_at) VALUES (?, ?, ?)",
+                (product_id, alias_name, time.strftime('%Y-%m-%d %H:%M:%S'))
+            )
+            logger.info(f"Добавлено альтернативное название '{alias_name}' для продукта '{product_name}'")
+            
+            # Очищаем кэш
+            get_product_data.cache_clear()
+            
             return True 

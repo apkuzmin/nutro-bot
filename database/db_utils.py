@@ -97,9 +97,23 @@ def init_products_db():
             )
             ''')
             
+            # Создаем таблицу альтернативных названий продуктов
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS product_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                alias_name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (product_id) REFERENCES products (id),
+                UNIQUE(alias_name)
+            )
+            ''')
+            
             # Создаем индексы для ускорения поиска
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_barcodes_product_id ON barcodes(product_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_product_aliases_name ON product_aliases(alias_name)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_product_aliases_product_id ON product_aliases(product_id)')
 
 def init_users_db():
     """Инициализировать базу данных пользователей."""
