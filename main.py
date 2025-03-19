@@ -2,7 +2,7 @@ import logging
 import os
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler, ContextTypes
-from handlers.menu_handlers import start, settings, subscription, home
+from handlers.menu_handlers import start, settings, subscription, home, help_command
 from handlers.user_data_handlers import update, gender, age, weight, height, activity, goal, timezone
 from handlers.food_handlers import add_food, food_name, food_name_buttons, food_weight, admin_kcal, admin_protein, admin_fat, admin_carbs, handle_webapp_data
 from handlers.log_handlers import show_food_log, edit_menu, edit_food_weight
@@ -36,6 +36,7 @@ async def set_bot_commands(app):
         BotCommand("start", "Начать работу с ботом"),
         BotCommand("summary", "Показать итоги дня"),
         BotCommand("log", "Показать историю питания"),
+        BotCommand("help", "Показать справку по использованию бота"),
     ]
     await app.bot.set_my_commands(commands)
 
@@ -69,6 +70,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data), group=2)
     app.add_handler(CommandHandler("summary", send_daily_summary_now), group=2)
     app.add_handler(CommandHandler("log", show_food_log), group=2)
+    app.add_handler(CommandHandler("help", help_command), group=2)
 
     # ConversationHandler для управления диалогами
     conv_handler = ConversationHandler(

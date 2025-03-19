@@ -71,7 +71,10 @@ async def add_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         from handlers.utils import get_main_menu
         keyboard = [[InlineKeyboardButton("🏠 Главное меню", callback_data="home")]]
         await query.edit_message_text(
-            "🔍 <b>Введите продукт, который хотите добавить.</b>\nНапример: Запеченная куриная грудка",
+            "🔍 <b>Введите продукт, который хотите добавить.</b>\n\n"
+            "Обычный формат: <i>Запеченная куриная грудка</i>\n\n"
+            "Или с указанием КБЖУ на 100г: <i>Название продукта калории белки жиры углеводы</i>\n"
+            "Например: <i>Тильзитер сыр 310 23 24 0</i>",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
@@ -81,12 +84,70 @@ async def add_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.edit_message_text("Произошла ошибка. Попробуй снова.", reply_markup=get_main_menu())
         return ConversationHandler.END
 
+def parse_custom_format(input_text):
+    """
+    Проверяет, соответствует ли ввод пользователя формату "Название X Y Z W",
+    где X, Y, Z, W - числа (ккал, белки, жиры, углеводы).
+    
+    Args:
+        input_text (str): Текст, введенный пользователем
+        
+    Returns:
+        tuple: (food_name, kcal, protein, fat, carbs) или None, если формат не распознан
+    """
+    # Паттерн для распознавания формата "Название X Y Z W"
+    # Ищем строку, за которой следуют 4 числа (целые или с плавающей точкой)
+    pattern = r'^(.+?)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)$'
+    match = re.match(pattern, input_text.strip())
+    
+    if match:
+        try:
+            food_name = match.group(1).strip()
+            kcal = float(match.group(2))
+            protein = float(match.group(3))
+            fat = float(match.group(4))
+            carbs = float(match.group(5))
+            
+            # Проверяем корректность значений
+            if (kcal < 0 or kcal > 900 or 
+                protein < 0 or protein > 100 or 
+                fat < 0 or fat > 100 or 
+                carbs < 0 or carbs > 100 or
+                protein + fat + carbs > 110):
+                logger.warning(f"Некорректные значения КБЖУ: {kcal}, {protein}, {fat}, {carbs}")
+                return None
+                
+            logger.info(f"Распознан пользовательский формат: {food_name} - {kcal} ккал, {protein}г белка, {fat}г жира, {carbs}г углеводов")
+            return (food_name, kcal, protein, fat, carbs)
+        except ValueError:
+            logger.warning(f"Ошибка при преобразовании чисел в пользовательском формате: {input_text}")
+            return None
+    
+    return None
+
 async def food_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    food = update.message.text.lower()
-    original_food = food  # Сохраняем оригинальный запрос пользователя
-    context.user_data["original_food"] = original_food  # Сохраняем для возможного использования
+    if not context.user_data.get("food_log_date"):
+        context.user_data["food_log_date"] = time.strftime("%Y-%m-%d")
+        
+    food = update.message.text.strip()
     context.user_data["food"] = food
-    logger.debug(f"Food name entered: {food}")
+    original_food = food  # Сохраняем оригинальный запрос
+    
+    # Проверяем, не в формате ли "Название X Y Z W"
+    custom_format = parse_custom_format(food)
+    if custom_format:
+        food_name, kcal, protein, fat, carbs = custom_format
+        context.user_data["food"] = food_name  # Обновляем название в контексте
+        context.user_data["food_data"] = (kcal, protein, fat, carbs)
+        
+        from handlers.utils import get_main_menu
+        keyboard = [[InlineKeyboardButton("🏠 Главное меню", callback_data="home")]]
+        message = f"✅ {food_name.capitalize()} — {kcal:.0f} ккал ({protein:.1f}Б / {fat:.1f}Ж / {carbs:.1f}У) на 100г\nУкажи вес в граммах:"
+        await update.message.reply_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return FOOD_WEIGHT
 
     result = get_product_data(food)
     if result:
